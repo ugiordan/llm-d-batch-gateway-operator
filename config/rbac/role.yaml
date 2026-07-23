@@ -72,6 +72,12 @@ rules:
   - patch
   - update
 - apiGroups:
+  - config.openshift.io
+  resources:
+  - apiservers
+  verbs:
+  - get
+- apiGroups:
   - cert-manager.io
   resources:
   - certificates

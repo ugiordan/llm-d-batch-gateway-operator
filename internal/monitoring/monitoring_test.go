@@ -68,6 +68,11 @@ func TestReconcileOperatorMonitoring(t *testing.T) {
 		if svc.Spec.Selector["app.kubernetes.io/name"] != utils.OperatorName {
 			t.Errorf("selector app.kubernetes.io/name = %q, want %q", svc.Spec.Selector["app.kubernetes.io/name"], utils.OperatorName)
 		}
+
+		wantAnnotation := utils.OperatorName + "-metrics-tls"
+		if got := svc.Annotations["service.beta.openshift.io/serving-cert-secret-name"]; got != wantAnnotation {
+			t.Errorf("serving-cert annotation = %q, want %q", got, wantAnnotation)
+		}
 	})
 
 	t.Run("creates ServiceMonitor", func(t *testing.T) {
@@ -78,8 +83,18 @@ func TestReconcileOperatorMonitoring(t *testing.T) {
 		if len(sm.Spec.Endpoints) != 1 {
 			t.Fatalf("expected 1 endpoint, got %d", len(sm.Spec.Endpoints))
 		}
-		if sm.Spec.Endpoints[0].Port != "https" {
-			t.Errorf("endpoint port = %q, want %q", sm.Spec.Endpoints[0].Port, "https")
+		ep := sm.Spec.Endpoints[0]
+		if ep.Port != "https" {
+			t.Errorf("endpoint port = %q, want %q", ep.Port, "https")
+		}
+		if ep.Scheme == nil || ep.Scheme.String() != "https" {
+			t.Errorf("endpoint scheme = %v, want https", ep.Scheme)
+		}
+		if ep.BearerTokenFile != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+			t.Errorf("endpoint bearerTokenFile = %q, want SA token path", ep.BearerTokenFile)
+		}
+		if ep.TLSConfig == nil || ep.TLSConfig.InsecureSkipVerify == nil || !*ep.TLSConfig.InsecureSkipVerify {
+			t.Errorf("endpoint TLSConfig.InsecureSkipVerify should be true")
 		}
 		if sm.Spec.Selector.MatchLabels["app.kubernetes.io/name"] != utils.OperatorName {
 			t.Errorf("selector app.kubernetes.io/name = %q, want %q", sm.Spec.Selector.MatchLabels["app.kubernetes.io/name"], utils.OperatorName)

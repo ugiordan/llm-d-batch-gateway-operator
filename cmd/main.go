@@ -1,18 +1,27 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	configv1 "github.com/openshift/api/config/v1"
+	tlspkg "github.com/openshift/controller-runtime-common/pkg/tls"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -68,6 +77,7 @@ func componentImagesFromEnv() (controller.ComponentImages, error) {
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors;prometheusrules,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get
 
 var (
 	scheme                  = runtime.NewScheme()
@@ -81,6 +91,7 @@ func init() {
 	utilruntime.Must(gatewayv1.Install(scheme))
 	utilruntime.Must(gatewayv1beta1.Install(scheme))
 	utilruntime.Must(monitoringv1.AddToScheme(scheme))
+	utilruntime.Must(configv1.Install(scheme))
 }
 
 func main() {
@@ -106,10 +117,52 @@ func main() {
 	logger := klog.NewKlogr()
 	ctrl.SetLogger(logger)
 
+	// Resolve the cluster TLS profile for secure metrics serving.
+	bootstrapClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		logger.Error(err, "unable to create bootstrap client")
+		os.Exit(1)
+	}
+
+	bootstrapCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var tlsOpts []func(*tls.Config)
+	profile, err := tlspkg.FetchAPIServerTLSProfile(bootstrapCtx, bootstrapClient)
+	if err != nil {
+		switch {
+		case apimeta.IsNoMatchError(err):
+			logger.Info("TLS profile not available (non-OpenShift cluster)")
+		case apierrors.IsNotFound(err):
+			logger.Info("APIServer resource not found, using defaults")
+		case apierrors.IsServiceUnavailable(err),
+			apierrors.IsTimeout(err),
+			apierrors.IsServerTimeout(err),
+			apierrors.IsTooManyRequests(err),
+			errors.Is(err, context.DeadlineExceeded):
+			logger.Info("Transient API error, using Intermediate defaults", "error", err)
+		default:
+			logger.Error(err, "unable to read TLS profile")
+			os.Exit(1)
+		}
+		profile = *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
+	}
+	tlsConfigFn, unsupported := tlspkg.NewTLSConfigFromProfile(profile)
+	if len(unsupported) > 0 {
+		logger.Info("TLS profile contains unsupported ciphers", "unsupported", unsupported)
+	}
+	tlsOpts = append(tlsOpts, tlsConfigFn)
+	tlsOpts = append(tlsOpts, func(c *tls.Config) {
+		c.NextProtos = []string{"h2", "http/1.1"}
+	})
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
+			BindAddress:    metricsAddr,
+			SecureServing:  true,
+			TLSOpts:        tlsOpts,
+			FilterProvider: filters.WithAuthenticationAndAuthorization,
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
